@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>1학년 6반 자리 티켓팅</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <style>
+        .font-inter { font-family: 'Inter', sans-serif; }
+    </style>
+    <!-- React & Babel CDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Lucide Icons CDN -->
+    <script src="https://unpkg.com/lucide-react@latest/dist/umd/lucide-react.js"></script>
+    <!-- Firebase CDN -->
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Firebase Auth 및 Firestore 모듈을 전역 변수에서 가져옵니다.
+        const { initializeApp } = firebase;
+        const { getAuth, signInAnonymously } = firebase.auth;
+        const { getFirestore, doc, setDoc, onSnapshot } = firebase.firestore;
+        
+        // Lucide React 컴포넌트들을 전역 변수에서 가져옵니다.
+        const { Users, Check, User, Shield, ShieldOff, Loader2, RotateCcw } = lucide;
+
+        // --- 1단계: 사용자님의 Firebase 설정으로 교체하세요! ---
+        // 이 부분을 사용자님의 실제 Firebase 콘솔 정보로 반드시 교체해야 합니다.
+        const firebaseConfig = {
+            apiKey: "[YOUR_API_KEY_HERE]", 
+            authDomain: "[YOUR_AUTH_DOMAIN_HERE]",
+            projectId: "[YOUR_PROJECT_ID_HERE]", // 실제 프로젝트 ID로 교체하세요.
+            storageBucket: "[YOUR_STORAGE_BUCKET_HERE]",
+            messagingSenderId: "[YOUR_MESSAGING_SENDER_ID_HERE]",
+            appId: "[YOUR_FIREBASE_APP_ID_HERE]" // 실제 앱 ID로 교체하세요.
+        };
+        // 캔버스 환경에서 사용되던 __app_id 변수는 이제 Firebase project ID를 기반으로 대체됩니다.
+        const YOUR_PROJECT_ID = firebaseConfig.projectId;
+        // ----------------------------------------------------
+
+        const { useState, useEffect, useCallback } = React;
+
+        // 초기 자리 상태 정의
+        const initialSeats = {
+            section1: Array(8).fill(null),
+            section2: Array(8).fill(null),
+            section3: Array(9).fill(null),
+            section4: Array(6).fill(null)
+        };
+        const INITIAL_STATE = {
+            seats: initialSeats,
+            isStarted: false,
+        };
+        const TOTAL_SEATS = 31;
+
+
+        /**
+         * Custom Notification Component to replace window.alert()
+         */
+        const NotificationBar = ({ notification, setNotification }) => {
+          useEffect(() => {
+            if (notification.content) {
+              const timer = setTimeout(() => {
+                setNotification({ content: '', type: null });
+              }, 3000);
+              return () => clearTimeout(timer);
+            }
+          }, [notification, setNotification]);
+
+          if (!notification.content) return null;
+
+          const baseClasses = "fixed top-4 left-1/2 transform -translate-x-1/2 p-4 rounded-xl shadow-2xl z-50 text-white font-semibold transition-opacity duration-300";
+          const typeClasses = notification.type === 'error'
+            ? 'bg-red-500'
+            : 'bg-green-500';
+
+          return (
+            <div className={`${baseClasses} ${typeClasses}`}>
+              {notification.content}
+            </div>
+          );
+        };
+
+        // --- 메인 컴포넌트 시작 ---
+        function ClassroomSeatingApp() {
+          // --- Firebase States ---
+          const [db, setDb] = useState(null);
+          const [userId, setUserId] = useState(null);
+          const [isLoading, setIsLoading] = useState(true); // 초기 데이터 로딩 상태
+
+          // --- App States (Firestore에서 동기화됨) ---
+          const [seats, setSeats] = useState(initialSeats);
+          const [isStarted, setIsStarted] = useState(false); // 티켓팅 시작 여부
+
+          // --- Local States ---
+          const [studentName, setStudentName] = useState('');
+          const [selectedSeat, setSelectedSeat] = useState(null);
+          const [isAdminMode, setIsAdminMode] = useState(false);
+          const [showPasswordInput, setShowPasswordInput] = useState(false);
+          const [passwordInput, setPasswordInput] = useState('');
+          const [cancelTarget, setCancelTarget] = useState(null); // 취소 확인창 표시용
+          const [notification, setNotification] = useState({ content: '', type: null });
+          const [showResetConfirm, setShowResetConfirm] = useState(false); // 초기화 확인창
+
+          // Helper function to display temporary notification
+          const showNotification = useCallback((content, type) => {
+            setNotification({ content, type });
+          }, []);
+
+          // Firestore 데이터 쓰기 함수 (통합)
+          const updateClassroomState = useCallback(async (updates) => {
+            if (!db || isLoading) {
+              showNotification('데이터베이스 연결 대기 중이거나 로딩 중입니다.', 'error');
+              return;
+            }
+            
+            // 데이터 경로: /seats/classroom-state (공개 데이터로 단순화)
+            // GitHub 배포 환경에서는 /artifacts/{appId}/public/data 경로를 사용할 필요가 없습니다.
+            const docRef = doc(db, 'seats', 'classroom-state'); 
+            try {
+              await setDoc(docRef, updates, { merge: true });
+              // 로컬 상태 업데이트는 onSnapshot 리스너를 통해 자동으로 이루어집니다.
+            } catch (error) {
+              console.error("Error updating classroom state in Firestore:", error);
+              showNotification('데이터 저장에 실패했습니다. (Firestore 에러)', 'error');
+            }
+          }, [db, isLoading, showNotification]);
+
+          // --- Firebase 초기화 및 실시간 리스너 설정 ---
+          useEffect(() => {
+            if (!firebaseConfig.apiKey === '[YOUR_API_KEY_HERE]') {
+                console.error("Firebase configuration is missing or placeholder.");
+                showNotification("Firebase 설정을 먼저 교체해주세요!", "error");
+                return;
+            }
+            
+            try {
+              const app = initializeApp(firebaseConfig);
+              const dbInstance = getFirestore(app);
+              const authInstance = getAuth(app);
+
+              setDb(dbInstance);
+
+              const authenticateAndListen = async () => {
+                try {
+                  // GitHub 환경에서는 플랫폼 토큰이 없으므로 익명 로그인만 시도합니다.
+                  await signInAnonymously(authInstance);
+                  
+                  const currentUserId = authInstance.currentUser?.uid || crypto.randomUUID();
+                  setUserId(currentUserId);
+
+                  // Firestore 리스너 설정: 'seats' 컬렉션의 'classroom-state' 문서 사용
+                  const docRef = doc(dbInstance, 'seats', 'classroom-state');
+
+                  const unsubscribe = onSnapshot(docRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                      const data = docSnap.data();
+                      // Firestore 데이터로 로컬 상태 동기화
+                      setSeats(data.seats || initialSeats);
+                      setIsStarted(data.isStarted || false);
+                    } else {
+                      // 문서가 없으면 초기 상태로 생성 (첫 사용자)
+                      setDoc(docRef, INITIAL_STATE)
+                        .then(() => console.log("Initial state created."))
+                        .catch(error => console.error("Error creating initial state:", error));
+                      setSeats(initialSeats);
+                      setIsStarted(false);
+                    }
+                    setIsLoading(false); // 초기 로딩 완료
+                  }, (error) => {
+                    console.error("Firestore real-time listener failed:", error);
+                    showNotification("실시간 연결에 실패했습니다.", "error");
+                    setIsLoading(false);
+                  });
+
+                  return unsubscribe;
+                } catch (error) {
+                  console.error("Firebase authentication failed:", error);
+                  showNotification("인증에 실패했습니다. (Firebase)", "error");
+                  setIsLoading(false);
+                }
+              };
+
+              const unsubscribe = authenticateAndListen();
+              return () => {
+                if (unsubscribe && typeof unsubscribe === 'function') {
+                  unsubscribe();
+                }
+              };
+
+            } catch (e) {
+              console.error("Firebase initialization failed:", e);
+              setIsLoading(false);
+            }
+          }, []);
+
+          // --- App Logic Functions (Uses updateClassroomState) ---
+
+          const toggleAdminMode = () => {
+            if (!isAdminMode) {
+              setShowPasswordInput(true);
+            } else {
+              setIsAdminMode(false);
+              setShowPasswordInput(false);
+              setPasswordInput('');
+              showNotification('관리자 모드가 해제되었습니다.', 'success');
+            }
+          };
+
+          const checkPassword = () => {
+            if (passwordInput === '1234') {
+              setIsAdminMode(true);
+              setShowPasswordInput(false);
+              setPasswordInput('');
+              showNotification('관리자 모드가 활성화되었습니다.', 'success');
+            } else {
+              showNotification('비밀번호가 올바르지 않습니다.', 'error');
+              setPasswordInput('');
+            }
+          };
+
+          const handleSeatSelect = (section, index) => {
+            if (!isStarted && !isAdminMode) return; // 시작 전에는 관리자만 선택 가능
+            
+            if (seats[section][index] !== null) {
+              // 이미 차있는 자리 - 관리자만 취소 가능
+              if (isAdminMode) {
+                setCancelTarget({ section, index, name: seats[section][index] });
+              }
+              return;
+            }
+            // 빈 자리 선택
+            setSelectedSeat({ section, index });
+          };
+
+          const confirmCancel = () => {
+            if (cancelTarget) {
+              const name = cancelTarget.name;
+              const newSeats = { ...seats };
+              newSeats[cancelTarget.section][cancelTarget.index] = null;
+              
+              updateClassroomState({ seats: newSeats }); // Firestore에 업데이트
+              
+              setCancelTarget(null);
+              showNotification(`${name}님의 자리가 취소되었습니다.`, 'success');
+            }
+          };
+
+          const cancelCancel = () => {
+            setCancelTarget(null);
+          };
+
+          const toggleSeatingStart = () => {
+            if (!isAdminMode) return;
+            const newState = !isStarted;
+            updateClassroomState({ isStarted: newState }); // Firestore에 업데이트
+            showNotification(newState ? '티켓팅이 시작되었습니다!' : '티켓팅이 중지되었습니다.', 'success');
+          };
+          
+          // 새로 추가된 초기화 로직
+          const resetData = () => {
+            if (!isAdminMode) return;
+            setShowResetConfirm(true);
+          };
+          
+          const confirmReset = () => {
+              // 모든 자리 초기화 및 isStarted 상태 false로 업데이트
+              updateClassroomState(INITIAL_STATE);
+              setShowResetConfirm(false);
+              showNotification('모든 자리 배정 데이터가 초기화되었습니다.', 'success');
+          };
+
+          const cancelReset = () => {
+              setShowResetConfirm(false);
+          };
+
+          const confirmSeat = () => {
+            if (!isStarted) {
+              showNotification('아직 티켓팅이 시작되지 않았습니다!', 'error');
+              return;
+            }
+            if (!studentName.trim()) {
+              showNotification('학생 이름을 입력해주세요!', 'error');
+              return;
+            }
+            if (!selectedSeat) {
+              showNotification('자리를 선택해주세요!', 'error');
+              return;
+            }
+            
+            // 다중 사용자 환경에서 최종 확인 (자리 선점 방지)
+            if (seats[selectedSeat.section][selectedSeat.index] !== null) {
+              showNotification('죄송합니다. 선택한 자리가 방금 다른 사람에 의해 배정되었습니다. 다시 선택해주세요.', 'error');
+              setSelectedSeat(null);
+              return;
+            }
+
+            const newSeats = { ...seats };
+            newSeats[selectedSeat.section][selectedSeat.index] = studentName.trim();
+            
+            updateClassroomState({ seats: newSeats }); // Firestore에 업데이트
+            
+            // 로컬 초기화
+            showNotification(`${studentName.trim()}님의 자리가 배정되었습니다!`, 'success');
+            setStudentName('');
+            setSelectedSeat(null);
+          };
+
+          const getTotalOccupied = () => {
+            return Object.values(seats).reduce((sum, section) => {
+              return sum + section.filter(seat => seat !== null).length;
+            }, 0);
+          };
+
+          const getSeatNumber = (section, index) => {
+            // 1분단: 1~8, 2분단: 9~16, 3분단: 17~25, 4분단: 26~31
+            if (section === 'section1') return index + 1;
+            if (section === 'section2') return index + 9;
+            if (section === 'section3') return index + 17;
+            if (section === 'section4') return index + 26;
+          };
+
+          const renderSeat = (section, index, student) => {
+            const isOccupied = student !== null;
+            const isSelected = selectedSeat?.section === section && selectedSeat?.index === index;
+            const isDisabled = !isStarted && !isAdminMode;
+            
+            return (
+              <button
+                key={index}
+                onClick={() => handleSeatSelect(section, index)}
+                disabled={(isOccupied && !isAdminMode) || isDisabled || isLoading}
+                className={`
+                  w-24 h-24 rounded-xl border-2 flex items-center justify-center text-sm font-medium
+                  transition-all duration-200 shadow-md
+                  ${isLoading
+                    ? 'bg-gray-200 border-gray-300 cursor-wait text-gray-500'
+                    : isDisabled && !isOccupied
+                      ? 'bg-gray-100 border-gray-300 cursor-not-allowed text-gray-400'
+                      : isOccupied 
+                        ? isAdminMode
+                          ? 'bg-gray-300 border-gray-400 cursor-pointer text-gray-600 hover:bg-red-300 hover:border-red-400'
+                          : 'bg-gray-300 border-gray-400 cursor-not-allowed text-gray-600'
+                        : isSelected
+                          ? 'bg-blue-500 border-blue-600 text-white shadow-lg scale-105'
+                          : 'bg-white border-blue-400 hover:border-blue-600 hover:shadow-lg cursor-pointer'
+                  }
+                `}
+              >
+                {isLoading ? (
+                  <Loader2 size={24} className="animate-spin text-gray-500" />
+                ) : isOccupied ? (
+                  <div className="flex flex-col items-center gap-1">
+                    <User size={18} />
+                    <span className="text-xs font-bold truncate max-w-[80%]">{student}</span>
+                  </div>
+                ) : isSelected ? (
+                  <Check size={24} />
+                ) : (
+                  <span className="text-gray-500 font-bold text-xl">{getSeatNumber(section, index)}</span>
+                )}
+              </button>
+            );
+          };
+
+          const renderSection = (sectionKey, sectionNum) => {
+            const sectionSeats = seats[sectionKey];
+            let rows = [];
+            
+            // 섹션별 자리 렌더링 로직 (기존과 동일)
+            if (sectionNum === 1 || sectionNum === 2) {
+              for (let i = 0; i < 4; i++) {
+                const rowSeats = [];
+                for (let j = 0; j < 2; j++) {
+                  const idx = i * 2 + j;
+                  rowSeats.push(renderSeat(sectionKey, idx, sectionSeats[idx]));
+                }
+                rows.push(<div key={i} className="flex gap-4 justify-center">{rowSeats}</div>);
+              }
+            } else if (sectionNum === 3) {
+              for (let i = 0; i < 3; i++) {
+                const rowSeats = [];
+                for (let j = 0; j < 2; j++) {
+                  const idx = i * 2 + j;
+                  rowSeats.push(renderSeat(sectionKey, idx, sectionSeats[idx]));
+                }
+                rows.push(<div key={i} className="flex gap-4 justify-center">{rowSeats}</div>);
+              }
+              const lastRowSeats = [];
+              for (let j = 6; j < 9; j++) {
+                lastRowSeats.push(renderSeat(sectionKey, j, sectionSeats[j]));
+              }
+              rows.push(<div key={3} className="flex gap-4 justify-center">{lastRowSeats}</div>);
+            } else if (sectionNum === 4) {
+              for (let i = 0; i < 3; i++) {
+                const rowSeats = [];
+                for (let j = 0; j < 2; j++) {
+                  const idx = i * 2 + j;
+                  rowSeats.push(renderSeat(sectionKey, idx, sectionSeats[idx]));
+                }
+                rows.push(<div key={i} className="flex gap-4 justify-center">{rowSeats}</div>);
+              }
+            }
+
+            return (
+              <div className="flex flex-col gap-4">
+                {sectionNum === 1 ? (
+                  <div className="text-center mb-2">
+                    <div className="inline-block bg-amber-100 border-2 border-amber-500 rounded-lg px-6 py-3 font-bold text-amber-800 shadow-md">
+                      🪑 교탁
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mb-2 h-12"></div>
+                )}
+                {rows}
+              </div>
+            );
+          };
+
+          // --- Main Render ---
+
+          if (isLoading) {
+            return (
+              <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100">
+                <Loader2 className="h-10 w-10 text-blue-600 animate-spin" />
+                <p className="mt-4 text-lg text-blue-800 font-semibold">데이터를 로딩 중입니다...</p>
+                <p className="mt-2 text-sm text-gray-500">잠시만 기다려주세요.</p>
+              </div>
+            );
+          }
+
+          return (
+            <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-6 font-inter">
+              <NotificationBar notification={notification} setNotification={setNotification} />
+
+              {/* 초기화 확인 모달 */}
+                {showResetConfirm && (
+                    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                        <div className="bg-white p-8 rounded-xl shadow-2xl max-w-sm w-full text-center">
+                            <p className="text-xl font-bold text-red-600 mb-4">🚨 데이터 초기화 경고</p>
+                            <p className="text-gray-700 mb-6">
+                                정말로 모든 자리 배정 데이터와 티켓팅 상태를 **초기화**하시겠습니까? 이 작업은 되돌릴 수 없습니다.
+                            </p>
+                            <div className="flex justify-center gap-4">
+                                <button
+                                    onClick={confirmReset}
+                                    className="px-6 py-3 bg-red-500 text-white rounded-lg font-bold hover:bg-red-600 shadow-md transition-colors"
+                                >
+                                    예, 초기화합니다
+                                </button>
+                                <button
+                                    onClick={cancelReset}
+                                    className="px-6 py-3 bg-gray-300 text-gray-700 rounded-lg font-bold hover:bg-gray-400 shadow-md transition-colors"
+                                >
+                                    취소
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+
+              <div className="max-w-7xl mx-auto">
+                {/* 접속자 정보 표시 (다중 사용자 앱 필수 조건) */}
+                <div className="text-right text-xs text-gray-500 mb-2">
+                  현재 접속 ID: <span className="font-mono font-bold text-gray-700">{userId}</span>
+                </div>
+                
+                <div className="bg-white rounded-3xl shadow-2xl p-8 mb-8">
+                  <div className="flex items-center justify-between mb-6">
+                    <h1 className="text-3xl font-extrabold text-gray-800 flex items-center gap-3">
+                      <Users className="text-blue-600 w-8 h-8" />
+                      1학년 6반 자리 티켓팅
+                    </h1>
+                    <div className="flex items-center gap-3">
+                      {showPasswordInput && !isAdminMode ? (
+                        <>
+                          <input
+                            type="password"
+                            value={passwordInput}
+                            onChange={(e) => setPasswordInput(e.target.value)}
+                            onKeyPress={(e) => e.key === 'Enter' && checkPassword()}
+                            placeholder="비밀번호"
+                            className="px-3 py-2 border-2 border-gray-300 rounded-lg focus:border-blue-500 focus:outline-none w-32"
+                            autoFocus
+                          />
+                          <button
+                            onClick={checkPassword}
+                            className="px-3 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium shadow-md"
+                          >
+                            확인
+                          </button>
+                          <button
+                            onClick={() => {
+                              setShowPasswordInput(false);
+                              setPasswordInput('');
+                            }}
+                            className="px-3 py-2 bg-gray-300 text-gray-700 rounded-lg hover:bg-gray-400 font-medium"
+                          >
+                            취소
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={toggleAdminMode}
+                          className={`px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2 transition-colors shadow-lg ${
+                            isAdminMode 
+                              ? 'bg-red-500 text-white hover:bg-red-600' 
+                              : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                          }`}
+                        >
+                          {isAdminMode ? <ShieldOff size={18} /> : <Shield size={18} />}
+                          {isAdminMode ? '관리자 모드 (ON)' : '관리자'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <p className="text-center text-gray-600 mb-8">
+                    자유롭게 원하는 자리를 선택하고 확정하세요. 모든 변경 사항은 실시간으로 반영됩니다.
+                  </p>
+
+                  {/* 현황 및 시작 상태 */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                    <div className="p-4 bg-blue-50 rounded-xl shadow-inner border border-blue-200 text-center">
+                      <div className="text-2xl font-bold text-blue-700">
+                        {getTotalOccupied()} / {TOTAL_SEATS}명
+                      </div>
+                      <div className="text-sm text-blue-600 mt-1 font-medium">배정 현황</div>
+                    </div>
+                    <div className="p-4 bg-green-50 rounded-xl shadow-inner border border-green-200 text-center">
+                      <div className="text-2xl font-bold text-green-700">
+                        {TOTAL_SEATS - getTotalOccupied()}개
+                      </div>
+                      <div className="text-sm text-green-600 mt-1 font-medium">남은 자리</div>
+                    </div>
+
+                    {isAdminMode ? (
+                        <div className="p-4 bg-yellow-50 border-2 border-yellow-300 rounded-xl shadow-inner">
+                            <div className="flex flex-col h-full justify-between">
+                                <span className="font-medium text-gray-700 mb-2">
+                                    티켓팅 상태: <span className={`font-bold ${isStarted ? 'text-green-600' : 'text-red-600'}`}>{isStarted ? '진행 중 🟢' : '대기 중 🔴'}</span>
+                                </span>
+                                <div className="flex gap-2">
+                                     <button
+                                        onClick={toggleSeatingStart}
+                                        className={`flex-1 py-2 rounded-lg font-bold transition-colors shadow-md text-white ${
+                                            isStarted
+                                                ? 'bg-red-500 hover:bg-red-600'
+                                                : 'bg-green-500 hover:bg-green-600'
+                                        }`}
+                                    >
+                                        {isStarted ? '중지' : '시작'}
+                                    </button>
+                                     <button
+                                        onClick={resetData}
+                                        className="w-1/3 py-2 bg-gray-400 text-white rounded-lg font-bold hover:bg-gray-500 shadow-md transition-colors flex items-center justify-center gap-1"
+                                    >
+                                        <RotateCcw size={18} /> 초기화
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className={`p-4 rounded-xl shadow-inner text-center ${isStarted ? 'bg-green-100 border border-green-300' : 'bg-red-100 border border-red-300'}`}>
+                            <p className={`font-bold text-xl ${isStarted ? 'text-green-800' : 'text-red-800'}`}>
+                                {isStarted ? '✅ 티켓팅 진행 중' : '⏸️ 티켓팅 대기 중'}
+                            </p>
+                            <p className="text-sm text-gray-600 mt-1">
+                                {isStarted ? '원하는 자리를 선택하세요.' : '선생님의 시작을 기다려주세요.'}
+                            </p>
+                        </div>
+                    )}
+                  </div>
+
+                  {/* 학생 이름 입력 & 자리 선택 */}
+                  <div className="p-6 bg-gray-50 rounded-2xl shadow-inner">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-end">
+                        <div className="md:col-span-1">
+                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                학생 이름
+                            </label>
+                            <input
+                                type="text"
+                                value={studentName}
+                                onChange={(e) => setStudentName(e.target.value)}
+                                placeholder="이름을 입력하세요"
+                                className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:border-blue-500 focus:outline-none text-lg transition-colors"
+                                disabled={!isStarted && !isAdminMode}
+                            />
+                        </div>
+
+                        <div className="md:col-span-1 text-center">
+                            {selectedSeat ? (
+                                <div className="p-3 bg-blue-100 rounded-lg border border-blue-300">
+                                    <span className="text-blue-700 font-bold text-lg">
+                                        선택한 자리: {selectedSeat.section.replace('section', '')}분단 {getSeatNumber(selectedSeat.section, selectedSeat.index)}번
+                                    </span>
+                                </div>
+                            ) : (
+                                <div className="p-3 bg-gray-100 rounded-lg border border-gray-300 text-gray-500 font-medium">
+                                    자리를 선택해주세요
+                                </div>
+                            )}
+                        </div>
+                        
+                        <div className="md:col-span-1">
+                            <button
+                                onClick={confirmSeat}
+                                disabled={!studentName.trim() || !selectedSeat || !isStarted}
+                                className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 text-white py-3 rounded-lg font-bold text-lg hover:from-blue-700 hover:to-indigo-700 disabled:from-gray-400 disabled:to-gray-500 disabled:cursor-not-allowed shadow-xl transition-all duration-200 transform hover:scale-[1.01]"
+                            >
+                                자리 확정하기
+                            </button>
+                        </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 자리 배치도 */}
+                <div className="bg-white rounded-3xl shadow-2xl p-8">
+                  <h2 className="text-2xl font-bold text-center mb-6 text-gray-800">
+                    🪑 실시간 교실 배치도
+                  </h2>
+
+                  {/* 취소 확인창 (관리자 모드에서만 표시) */}
+                  {cancelTarget && (
+                    <div className="mb-6 p-4 bg-red-50 border-2 border-red-300 rounded-xl text-center shadow-md">
+                      <p className="text-center text-red-700 font-bold mb-4 text-lg">
+                        정말로 <span className="text-red-900">{cancelTarget.name}</span>님의 자리를 취소하시겠습니까?
+                      </p>
+                      <div className="flex justify-center gap-4">
+                        <button
+                          onClick={confirmCancel}
+                          className="px-6 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 font-bold shadow-lg transition-colors"
+                        >
+                          예, 취소합니다
+                        </button>
+                        <button
+                          onClick={cancelCancel}
+                          className="px-6 py-2 bg-gray-300 text-gray-700 rounded-lg hover:bg-gray-400 font-bold transition-colors"
+                        >
+                          아니오
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="mb-8 flex justify-center gap-6 text-sm p-4 bg-gray-100 rounded-lg">
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 bg-white border-2 border-blue-400 rounded-full"></div>
+                      <span className="font-medium text-gray-700">빈 자리</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 bg-blue-500 border-2 border-blue-600 rounded-full"></div>
+                      <span className="font-medium text-gray-700">선택 중</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 bg-gray-300 border-2 border-gray-400 rounded-full"></div>
+                      <span className="font-medium text-gray-700">배정 완료</span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-10">
+                    {renderSection('section1', 1)}
+                    {renderSection('section2', 2)}
+                    {renderSection('section3', 3)}
+                    {renderSection('section4', 4)}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        }
+        
+        // React App을 렌더링합니다.
+        ReactDOM.render(<ClassroomSeatingApp />, document.getElementById('root'));
+    </script>
+</body>
+</html>
