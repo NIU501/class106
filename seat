@@ -1,0 +1,293 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken, 
+  onAuthStateChanged,
+  setPersistence,
+  inMemoryPersistence,
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  query, 
+  onSnapshot, 
+  doc, 
+  serverTimestamp,
+  setLogLevel,
+  runTransaction, // **선착순 제어를 위한 핵심 기능**
+  setDoc,
+  getDocs,
+} from 'firebase/firestore';
+
+// 전역 변수 설정 (캔버스 환경에서 제공됨)
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// 최종 좌석 목록 (31개)
+const initialSeatIds = Array.from({ length: 31 }, (_, i) => `S-${i + 1}`);
+
+const App = () => {
+  // 사용자 상태
+  const [db, setDb] = useState(null);
+  const [userId, setUserId] = useState(null);
+  
+  // 앱 상태
+  /** @type {[Seat[], React.Dispatch<React.SetStateAction<Seat[]>>]} */
+  const [seats, setSeats] = useState([]);
+  const [loading, setLoading] = useState(true);
+  
+  // 오류 및 메시지 상태
+  const [error, setError] = useState('');
+  const [transactionError, setTransactionError] = useState(''); // 선착순 배정 실패 시 메시지
+
+  // Firebase 초기화 및 인증 처리
+  useEffect(() => {
+    setLogLevel('debug');
+    
+    try {
+      if (Object.keys(firebaseConfig).length === 0) {
+        setError('Firebase 설정이 제공되지 않았습니다.');
+        setLoading(false);
+        return;
+      }
+
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const authInstance = getAuth(app);
+      
+      setDb(firestore);
+
+      const handleAuth = async () => {
+        try {
+          await setPersistence(authInstance, inMemoryPersistence);
+          
+          if (initialAuthToken) {
+            await signInWithCustomToken(authInstance, initialAuthToken);
+          } else {
+            await signInAnonymously(authInstance);
+          }
+        } catch (authError) {
+          console.error("[AUTH ERROR] Authentication failed:", authError);
+          setError(`인증 실패: ${authError.message}`);
+          setLoading(false);
+        }
+      };
+
+      const unsubscribe = onAuthStateChanged(authInstance, (user) => {
+        if (user) {
+          console.log(`[AUTH STATE] User signed in. UID: ${user.uid}`);
+          setUserId(user.uid);
+          setLoading(false);
+        } else {
+          console.log("[AUTH STATE] User signed out. Attempting sign-in...");
+          if (!userId) {
+            handleAuth();
+          }
+        }
+      });
+      
+      return () => unsubscribe();
+      
+    } catch (e) {
+      console.error("[INIT ERROR] Firebase initialization failed:", e);
+      setError(`초기화 실패: ${e.message}`);
+      setLoading(false);
+    }
+  }, []);
+
+  // 초기 좌석 데이터 생성 (컬렉션이 비어있을 경우 또는 좌석이 부족할 경우)
+  const createInitialSeats = useCallback(async (dbInstance) => {
+    const seatsCollectionRef = collection(dbInstance, `artifacts/${appId}/public/data/seats`);
+    const snapshot = await getDocs(seatsCollectionRef);
+    const existingIds = new Set(snapshot.docs.map(doc => doc.id));
+    
+    const needsUpdate = initialSeatIds.some(seatId => !existingIds.has(seatId)) || snapshot.empty;
+    
+    if (needsUpdate) {
+      console.log("[FIRESTORE] Seats collection initializing/ensuring all 31 seats exist.");
+      for (const seatId of initialSeatIds) {
+        if (!existingIds.has(seatId)) {
+             await setDoc(doc(seatsCollectionRef, seatId), {
+                seatId: seatId,
+                isTaken: false,
+                assignedToUserId: '',
+                assignedToUserName: '',
+                reservedAt: null
+            });
+        }
+      }
+    }
+  }, []);
+
+  // 데이터 가져오기 (onSnapshot listener)
+  useEffect(() => {
+    if (db && userId) {
+      createInitialSeats(db); 
+      
+      const seatsCollectionRef = collection(db, `artifacts/${appId}/public/data/seats`);
+      const q = query(seatsCollectionRef);
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedSeats = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+        
+        fetchedSeats.sort((a, b) => {
+            const numA = parseInt(a.id.split('-')[1]);
+            const numB = parseInt(b.id.split('-')[1]);
+            return numA - numB;
+        });
+
+        setSeats(fetchedSeats);
+        setError('');
+      }, (e) => {
+        console.error("[FIRESTORE ERROR] Snapshot failed:", e);
+        setError(`데이터 로드 실패: ${e.message}`);
+      });
+
+      return () => unsubscribe();
+    }
+  }, [db, userId, createInitialSeats]);
+
+  // **선착순 좌석 배정을 위한 트랜잭션 함수 (Concurrency Control)**
+  const allocateSeat = async (seatId) => {
+    if (!db || !userId) return;
+    
+    setTransactionError(''); 
+
+    const seatRef = doc(db, `artifacts/${appId}/public/data/seats/${seatId}`);
+    
+    try {
+      await runTransaction(db, async (transaction) => {
+        const seatDoc = await transaction.get(seatRef);
+
+        if (!seatDoc.exists()) {
+            throw new Error("SEAT_NOT_FOUND"); 
+        }
+
+        const data = seatDoc.data();
+        if (data.isTaken) {
+          throw new Error("ALREADY_TAKEN"); 
+        } else {
+          // 사용자 ID의 앞 8자리를 임시 이름으로 저장합니다.
+          const genericUserName = `User-${userId.substring(0, 8)}`;
+          
+          transaction.update(seatRef, {
+            isTaken: true,
+            assignedToUserId: userId,
+            assignedToUserName: genericUserName, 
+            reservedAt: serverTimestamp()
+          });
+          console.log(`[TRANSACTION SUCCESS] Seat ${seatId} successfully allocated by ${genericUserName}.`);
+        }
+      });
+      
+    } catch (e) {
+      if (e.message === "ALREADY_TAKEN") {
+        // 요청하신 대로, 화면 상단에 에러 메시지 표시
+        setTransactionError('이미 배정이 완료된 좌석입니다.');
+        console.warn(`[TRANSACTION FAILED] Seat ${seatId} was already taken.`);
+        setTimeout(() => setTransactionError(''), 3000); 
+      } else {
+        console.error("[TRANSACTION ERROR] Allocation failed:", e);
+        setError(`좌석 배정 실패: ${e.message}`);
+      }
+    }
+  };
+
+  // UI 렌더링
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50">
+        <script src="https://cdn.tailwindcss.com"></script>
+        <div className="text-xl font-medium text-indigo-600 animate-pulse">
+          파이어베이스 연결 및 인증 확인 중...
+        </div>
+      </div>
+    );
+  }
+
+  const sortedSeats = seats.length === 31 
+    ? seats 
+    : initialSeatIds.map(id => seats.find(s => s.id === id) || { 
+        id, isTaken: false, assignedToUserId: '', assignedToUserName: '', reservedAt: null 
+      });
+
+  return (
+    <div className="min-h-screen bg-gray-100 p-4 font-inter">
+      <script src="https://cdn.tailwindcss.com"></script>
+      <style>{`
+        .font-inter { font-family: 'Inter', sans-serif; }
+      `}</style>
+      
+      <div className="max-w-6xl mx-auto py-8">
+        <header className="mb-8 text-center">
+          <h1 className="text-3xl font-extrabold text-gray-900 mb-2">
+            🥇 선착순 좌석 배정 시스템 (총 31석)
+          </h1>
+          <p className="text-gray-600">
+            좌석을 클릭하여 배정을 시도하세요. 배정은 선착순으로 진행되며, 실시간으로 상태가 반영됩니다.
+          </p>
+          <div className="mt-4 p-3 bg-white rounded-lg shadow-md text-sm text-gray-700 inline-block">
+            <span className="font-semibold text-indigo-600">나의 식별자 (ID):</span> 
+            <code className="ml-2 bg-gray-100 p-1 rounded font-mono text-sm break-all">
+              {userId || "로그인되지 않음"}
+            </code>
+          </div>
+        </header>
+
+        {/* 오류 및 경고 메시지 영역 */}
+        {(error || transactionError) && (
+          <div className={`p-4 mb-4 text-sm rounded-lg shadow-lg ${transactionError ? 'bg-red-100 text-red-800 border-l-4 border-red-500' : 'bg-yellow-100 text-yellow-800 border-l-4 border-yellow-500'}`} role="alert">
+            <span className="font-medium">{transactionError ? '메시지:' : '시스템 오류:'}</span> {transactionError || error}
+          </div>
+        )}
+
+        {/* 좌석 배치도 - grid-cols-5로 변경하여 5열 배치 */}
+        <div className="grid grid-cols-5 gap-4 p-6 bg-white rounded-xl shadow-2xl">
+          {initialSeatIds.map((seatId) => {
+            const seat = sortedSeats.find(s => s.id === seatId);
+            const isTaken = seat?.isTaken;
+            const isMine = seat?.assignedToUserId === userId;
+            
+            // 배정된 사용자 표시 (User-xxxx 형식에서 xxxx만 추출)
+            const assignedUserName = seat?.assignedToUserName || '';
+            const assignedDisplay = assignedUserName.startsWith('User-') 
+                                    ? assignedUserName.split('-')[1] 
+                                    : assignedUserName; 
+
+            const buttonClass = isTaken 
+              ? (isMine ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-red-500 cursor-not-allowed') 
+              : 'bg-green-500 hover:bg-green-600';
+
+            const statusText = isTaken 
+              ? (isMine ? '✅ 배정 완료 (나)' : `❌ 배정됨 (${assignedDisplay})`) 
+              : '✅ 예약 가능';
+              
+            return (
+              <button
+                key={seatId}
+                onClick={() => !isTaken && allocateSeat(seatId)}
+                disabled={isTaken && !isMine}
+                className={`flex flex-col items-center justify-center p-3 h-24 text-white font-bold rounded-xl shadow-lg transform transition duration-200 ease-in-out text-center 
+                            ${isTaken && !isMine ? 'opacity-80' : 'hover:scale-[1.02] active:scale-[0.98]'}
+                            ${buttonClass}`}
+              >
+                <div className="text-lg mb-1">{seatId.replace('S-', '좌석 ')}</div>
+                <div className="text-[10px] font-medium leading-tight truncate">
+                    {statusText}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;
